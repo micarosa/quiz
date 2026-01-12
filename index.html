@@ -5,9 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Gemini AI 퀴즈 메이커</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <!-- PDF 추출을 위한 라이브러리 -->
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf-lib/1.17.1/pdf-lib.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.min.js"></script>
+    <!-- PDF 추출을 위한 라이브러리 (안정적인 버전 사용) -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
     <!-- PPTX 추출을 위한 라이브러리 -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
     <style>
@@ -108,8 +107,9 @@
         let extractedText = "";
         let isProcessing = false;
 
+        // PDF.js worker setup
         const pdfjsLib = window['pdfjs-dist/build/pdf'];
-        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.worker.min.js';
+        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
 
         // UI Listeners
         document.getElementById('qCount').addEventListener('input', (e) => {
@@ -124,7 +124,16 @@
             document.getElementById('fileInfo').classList.remove('hidden');
             document.getElementById('fileNameDisplay').innerText = file.name;
 
-            extractedText = await parseFile(file);
+            try {
+                extractedText = await parseFile(file);
+                if (!extractedText.trim()) {
+                    showAlert("분석 실패", "파일에서 텍스트를 추출하지 못했습니다. 파일이 비어있거나 보안이 걸려있을 수 있습니다.");
+                    resetFile();
+                }
+            } catch (error) {
+                showAlert("오류", "파일 처리 중 오류가 발생했습니다: " + error.message);
+                resetFile();
+            }
         });
 
         function resetFile() {
@@ -150,7 +159,8 @@
             try {
                 if (ext === 'pdf') {
                     const arrayBuffer = await file.arrayBuffer();
-                    const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+                    const loadingTask = pdfjsLib.getDocument({ data: arrayBuffer });
+                    const pdf = await loadingTask.promise;
                     let text = "";
                     for (let i = 1; i <= pdf.numPages; i++) {
                         const page = await pdf.getPage(i);
@@ -161,11 +171,10 @@
                 } else if (ext === 'txt') {
                     return await file.text();
                 } else if (ext === 'pptx') {
-                    // Simple text extraction for PPTX using JSZip (limited)
                     const arrayBuffer = await file.arrayBuffer();
                     const zip = await JSZip.loadAsync(arrayBuffer);
                     let text = "";
-                    const slideFiles = Object.keys(zip.files).filter(name => name.startsWith('ppt/slides/slide'));
+                    const slideFiles = Object.keys(zip.files).filter(name => name.startsWith('ppt/slides/slide') && name.endsWith('.xml'));
                     for (const slide of slideFiles) {
                         const content = await zip.file(slide).async("text");
                         const parser = new DOMParser();
@@ -176,8 +185,8 @@
                     return text;
                 }
             } catch (err) {
-                showAlert("오류", "파일을 읽는 중 오류가 발생했습니다.");
-                return "";
+                console.error("Parse Error:", err);
+                throw new Error(err.message);
             }
         }
 
@@ -186,39 +195,56 @@
             const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`;
             
             const payload = {
-                contents: [{ parts: [{ text: prompt }] }]
+                contents: [{ parts: [{ text: prompt }] }],
+                generationConfig: {
+                    temperature: 0.7,
+                    topK: 40,
+                    topP: 0.95,
+                    maxOutputTokens: 2048,
+                }
             };
 
-            const response = await fetch(url, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload)
-            });
+            try {
+                const response = await fetch(url, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
 
-            if (!response.ok) {
-                const err = await response.json();
-                throw new Error(err.error?.message || "API 호출 실패");
+                if (!response.ok) {
+                    const err = await response.json();
+                    throw new Error(err.error?.message || "API 요청 중 오류가 발생했습니다.");
+                }
+
+                const data = await response.json();
+                const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text;
+                
+                if (!rawText) throw new Error("AI로부터 응답을 받지 못했습니다.");
+                
+                // Extract JSON using regex to handle potential conversational wrappers
+                const jsonMatch = rawText.match(/\[\s*\{.*\}\s*\]/s) || rawText.match(/\{.*\}/s);
+                if (!jsonMatch) throw new Error("응답 형식(JSON)이 올바르지 않습니다. 다시 시도해주세요.");
+                
+                const parsed = JSON.parse(jsonMatch[0]);
+                return Array.isArray(parsed) ? parsed : [parsed];
+            } catch (error) {
+                console.error("API Error:", error);
+                throw error;
             }
-
-            const data = await response.json();
-            const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text;
-            
-            // Extract JSON
-            const jsonMatch = rawText.match(/\[.*\]/s) || rawText.match(/\{.*\}/s);
-            if (!jsonMatch) throw new Error("유효한 퀴즈 형식을 생성하지 못했습니다.");
-            
-            const parsed = JSON.parse(jsonMatch[0]);
-            return Array.isArray(parsed) ? parsed : [parsed];
         }
 
         async function handleGenerate() {
-            const apiKey = document.getElementById('apiKey').value;
+            const apiKey = document.getElementById('apiKey').value.trim();
             const qCount = document.getElementById('qCount').value;
 
             if (!apiKey) {
                 document.getElementById('keyWarning').classList.remove('hidden');
+                showAlert("설정 필요", "사이드바에서 Gemini API Key를 입력해주세요.");
                 return;
+            } else {
+                document.getElementById('keyWarning').classList.add('hidden');
             }
+
             if (!extractedText) {
                 showAlert("파일 없음", "먼저 학습 자료 파일을 업로드해주세요.");
                 return;
@@ -226,26 +252,35 @@
 
             setLoading(true);
             const prompt = `당신은 교육 전문가입니다. 아래 내용을 바탕으로 4지 선다형 퀴즈 ${qCount}개를 만들어주세요.
-                반드시 JSON 리스트 형식으로 출력하세요. 
+                반드시 JSON 리스트 형식으로 출력하세요. 다른 설명은 하지 마세요.
                 각 객체 키: "question", "options" (4개 항목 리스트), "answer" (options 중 하나), "explanation".
                 언어: 한국어.
-                내용: ${extractedText.substring(0, 10000)}`; // Token limit safety
+                내용: ${extractedText.substring(0, 8000)}`;
 
             try {
                 const results = await callGemini(prompt, apiKey);
                 currentQuizData = results;
                 renderQuizzes();
             } catch (err) {
-                showAlert("API 오류", err.message);
+                showAlert("오류", err.message);
             } finally {
                 setLoading(false);
             }
         }
 
         async function regenerateQuiz(idx) {
-            const apiKey = document.getElementById('apiKey').value;
+            const apiKey = document.getElementById('apiKey').value.trim();
+            if (!apiKey) {
+                showAlert("API Key 누락", "API Key를 입력해주세요.");
+                return;
+            }
+
+            const btn = event.currentTarget;
+            btn.disabled = true;
+            btn.innerHTML = "⌛...";
+
             const prompt = `위의 문맥을 바탕으로 새로운 4지 선다형 문제 딱 1개만 생성해주세요. 
-                형식은 이전과 동일한 JSON 객체여야 합니다. 
+                형식은 이전과 동일한 단일 JSON 객체여야 합니다. 
                 내용: ${extractedText.substring(0, 5000)}`;
 
             try {
@@ -253,7 +288,9 @@
                 currentQuizData[idx] = result[0];
                 renderQuizzes();
             } catch (err) {
-                showAlert("오류", "문제 재생성에 실패했습니다.");
+                showAlert("오류", "문제 재생성에 실패했습니다: " + err.message);
+                btn.disabled = false;
+                btn.innerHTML = "🔄 재생성";
             }
         }
 
@@ -267,7 +304,10 @@
             isProcessing = val;
             document.getElementById('generateBtn').disabled = val;
             document.getElementById('loader').classList.toggle('hidden', !val);
-            if (val) document.getElementById('quizContainer').innerHTML = "";
+            if (val) {
+                document.getElementById('quizContainer').innerHTML = "";
+                document.getElementById('downloadSection').classList.add('hidden');
+            }
         }
 
         function renderQuizzes() {
@@ -281,29 +321,32 @@
 
             currentQuizData.forEach((item, idx) => {
                 const div = document.createElement('div');
-                div.className = "bg-white p-6 rounded-2xl border shadow-sm flex flex-col md:flex-row gap-6";
+                div.className = "bg-white p-6 rounded-2xl border shadow-sm flex flex-col md:flex-row gap-6 transition-all animate-fadeIn";
                 div.innerHTML = `
                     <div class="flex-1">
                         <h4 class="text-lg font-bold mb-4">Q${idx+1}. ${item.question}</h4>
                         <div class="grid grid-cols-1 md:grid-cols-2 gap-3 mb-4 text-sm">
                             ${item.options.map((opt, i) => `
-                                <div class="p-3 border rounded-lg bg-gray-50">${i+1}) ${opt}</div>
+                                <div class="p-3 border rounded-lg bg-gray-50 flex items-start gap-2">
+                                    <span class="font-bold text-blue-500">${i+1}.</span>
+                                    <span>${opt}</span>
+                                </div>
                             `).join('')}
                         </div>
-                        <details class="group border rounded-lg overflow-hidden">
-                            <summary class="list-none p-3 bg-gray-100 cursor-pointer font-semibold text-sm flex justify-between items-center">
+                        <details class="group border rounded-lg overflow-hidden transition-all">
+                            <summary class="list-none p-3 bg-gray-100 cursor-pointer font-semibold text-sm flex justify-between items-center hover:bg-gray-200">
                                 정답 및 해설 확인
                                 <span class="group-open:rotate-180 transition-transform">▼</span>
                             </summary>
                             <div class="p-4 bg-blue-50">
-                                <p class="text-blue-700 font-bold mb-1">정답: ${item.answer}</p>
-                                <p class="text-gray-700 text-sm italic">${item.explanation}</p>
+                                <p class="text-blue-700 font-bold mb-1 underline">정답: ${item.answer}</p>
+                                <p class="text-gray-700 text-sm italic line-height-relaxed">${item.explanation}</p>
                             </div>
                         </details>
                     </div>
                     <div class="flex md:flex-col gap-2 justify-end md:justify-start">
-                        <button onclick="deleteQuiz(${idx})" class="p-2 text-red-500 hover:bg-red-50 rounded-lg text-sm font-bold border border-red-100">🗑️ 삭제</button>
-                        <button onclick="regenerateQuiz(${idx})" class="p-2 text-blue-600 hover:bg-blue-50 rounded-lg text-sm font-bold border border-blue-100">🔄 재생성</button>
+                        <button onclick="deleteQuiz(${idx})" class="p-2 text-red-500 hover:bg-red-50 rounded-lg text-sm font-bold border border-red-100 transition-colors">🗑️ 삭제</button>
+                        <button onclick="regenerateQuiz(${idx})" class="p-2 text-blue-600 hover:bg-blue-50 rounded-lg text-sm font-bold border border-blue-100 transition-colors">🔄 재생성</button>
                     </div>
                 `;
                 container.appendChild(div);
@@ -314,6 +357,8 @@
 
         // --- Export ---
         function downloadCSV() {
+            if (currentQuizData.length === 0) return;
+
             let csvContent = "\uFEFF"; // Byte Order Mark for Excel (UTF-8-SIG)
             csvContent += "번호,문제,보기1,보기2,보기3,보기4,정답,해설\n";
 
@@ -335,7 +380,7 @@
             const link = document.createElement("a");
             const url = URL.createObjectURL(blob);
             link.setAttribute("href", url);
-            link.setAttribute("download", `quiz_export_${Date.now()}.csv`);
+            link.setAttribute("download", `quiz_export_${new Date().getTime()}.csv`);
             link.style.visibility = 'hidden';
             document.body.appendChild(link);
             link.click();
